@@ -19,9 +19,13 @@
 
 import asyncio
 import logging
+import socket
 import urllib.parse
 import json
 from datetime import datetime, timezone
+
+# Глобальный таймаут для всех сокетов — feedparser зависнет максимум на 10 сек
+socket.setdefaulttimeout(10)
 
 import aiohttp
 import feedparser
@@ -35,8 +39,8 @@ from telegram.constants import ParseMode
 # =============================================================
 
 import os
-TOKEN      = os.environ.get("TOKEN", "8326800586:AAGhd1szBeHWT27rcnRvhdBr2cNuBxUPXk0")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "-1003752071804")  # например: @my_channel или -1001234567890
+TOKEN      = os.environ.get("TOKEN", "ВСТАВЬ_ТОКЕН_БОТА")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "ВСТАВЬ_ID_КАНАЛА")  # например: @my_channel или -1001234567890
 
 # Как часто проверять (в минутах)
 CHECK_INTERVAL_MINUTES = 60
@@ -343,22 +347,39 @@ async def run_monitor(app: Application):
     logging.info("🔍 Запуск мониторинга...")
 
     # Собираем данные из всех источников
-    torgi_items   = await fetch_all_torgi()
-    # Если torgi API вернул 0 — используем Google-резерв
+    # asyncio.to_thread — запускаем блокирующие feedparser-вызовы в отдельных потоках
+    torgi_items = await fetch_all_torgi()
     if not torgi_items:
         logging.info("torgi.gov.ru API недоступен, используем Google-резерв")
-        torgi_items = fetch_torgi_via_google()
-    zakupki_items = fetch_zakupki()
-    news_items    = fetch_google_news()
-    yandex_items  = fetch_yandex_news()
+        torgi_items = await asyncio.wait_for(
+            asyncio.to_thread(fetch_torgi_via_google), timeout=30
+        )
+
+    zakupki_items, news_items, yandex_items = await asyncio.gather(
+        asyncio.wait_for(asyncio.to_thread(fetch_zakupki),      timeout=30),
+        asyncio.wait_for(asyncio.to_thread(fetch_google_news),  timeout=30),
+        asyncio.wait_for(asyncio.to_thread(fetch_yandex_news),  timeout=30),
+        return_exceptions=True,
+    )
+    # Если какой-то источник завис/упал — заменяем на пустой список
+    if not isinstance(zakupki_items, list):
+        logging.warning(f"zakupki timeout/error: {zakupki_items}")
+        zakupki_items = []
+    if not isinstance(news_items, list):
+        logging.warning(f"google news timeout/error: {news_items}")
+        news_items = []
+    if not isinstance(yandex_items, list):
+        logging.warning(f"yandex timeout/error: {yandex_items}")
+        yandex_items = []
 
     all_items = torgi_items + zakupki_items + news_items + yandex_items
 
+    logging.info(f"📊 Найдено: torgi={len(torgi_items)}, zakupki={len(zakupki_items)}, google={len(news_items)}, yandex={len(yandex_items)}, итого={len(all_items)}")
+
     if all_items:
-        logging.info(f"✅ Найдено новых записей: {len(all_items)}")
         await send_items(app, all_items)
     else:
-        logging.info("ℹ️ Новых записей нет")
+        logging.info("ℹ️ Новых записей нет — ничего не отправлено в канал")
 
 # =============================================================
 # 🤖  КОМАНДЫ БОТА
@@ -384,8 +405,21 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🔍 Запускаю проверку...")
+    # Сначала проверяем доступ к каналу
+    try:
+        await ctx.application.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text="🔄 Запуск проверки новостей КРТ...",
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ Не могу писать в канал `{CHANNEL_ID}`\n\nОшибка: `{e}`\n\n"
+            f"Проверь:\n1. Бот добавлен в канал как администратор\n2. CHANNEL\\_ID верный",
+            parse_mode=ParseMode.MARKDOWN
+        )
+        return
     await run_monitor(ctx.application)
-    await update.message.reply_text("✅ Готово. Новые записи отправлены в канал.")
+    await update.message.reply_text("✅ Готово. Смотри канал.")
 
 
 async def cmd_keywords(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
