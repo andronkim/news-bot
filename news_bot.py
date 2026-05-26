@@ -36,7 +36,7 @@ from telegram.constants import ParseMode
 
 import os
 TOKEN      = os.environ.get("TOKEN", "8326800586:AAECnNqoc97CBzHraS7u1eHLaTAbDe6EkqY")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "8326800586")  # например: @my_channel или -1001234567890
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "@krt_newss")  # например: @my_channel или -1001234567890
 
 # Как часто проверять (в минутах)
 CHECK_INTERVAL_MINUTES = 60
