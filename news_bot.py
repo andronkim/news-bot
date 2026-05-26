@@ -1,14 +1,18 @@
 """
 =============================================================
-  TELEGRAM NEWS BOT — парсинг новостей по ключевым словам
+  КРТ-МОНИТОР — Telegram Bot
+  Источники: torgi.gov.ru · zakupki.gov.ru · Google News
 =============================================================
 
 БЫСТРЫЙ СТАРТ:
-1. pip install python-telegram-bot feedparser apscheduler
-2. Вставь TOKEN от @BotFather
-3. Вставь CHAT_ID (получи через @userinfobot)
-4. Добавь свои ключевые слова в KEYWORDS
-5. python news_bot.py
+1. pip install python-telegram-bot feedparser apscheduler aiohttp
+2. Вставь TOKEN, CHANNEL_ID
+3. python news_bot.py
+
+КАК ДОБАВИТЬ БОТА В КАНАЛ:
+- Зайди в настройки канала → Администраторы
+- Добавь своего бота как администратора
+- Дай права "Публикация сообщений"
 
 =============================================================
 """
@@ -16,123 +20,258 @@
 import asyncio
 import logging
 import urllib.parse
-from datetime import datetime
+import json
+from datetime import datetime, timezone
 
+import aiohttp
 import feedparser
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.constants import ParseMode
 
 # =============================================================
-# ⚙️  НАСТРОЙКИ — редактируй здесь
+# ⚙️  НАСТРОЙКИ
 # =============================================================
 
-TOKEN = "8326800586:AAECnNqoc97CBzHraS7u1eHLaTAbDe6EkqY"       # от @BotFather
-CHAT_ID = "8326800586"        # от @userinfobot или просто напиши боту /chatid
+import os
+TOKEN      = os.environ.get("TOKEN", "ВСТАВЬ_ТОКЕН_БОТА")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "ВСТАВЬ_ID_КАНАЛА")  # например: @my_channel или -1001234567890
 
-# Ключевые слова — добавляй/удаляй любые
+# Как часто проверять (в минутах)
+CHECK_INTERVAL_MINUTES = 60
+
+# =============================================================
+# 🔑  КЛЮЧЕВЫЕ СЛОВА
+# =============================================================
+
 KEYWORDS = [
     "КРТ",
     "Проект КРТ",
     "Комплексное развитие территорий",
+    "Комплексного развития территорий",
+    "Комплексного развития территории",
     "Масштабный инвестиционный проект",
+    "МИП",
     "Сделка по продаже актива",
     "Девелопер купил",
     "Девелопер продал",
+    "редевелопмент промзоны",
+    "промышленная зона продажа",
+    "земельный участок торги",
+    "аукцион земля девелопмент",
 ]
 
-# Как часто проверять новости (в часах)
-CHECK_INTERVAL_HOURS = 1
-
-# Сколько новостей максимум в одном дайджесте
-MAX_NEWS_PER_DIGEST = 10
-
 # =============================================================
-# 📡  ИСТОЧНИКИ НОВОСТЕЙ
+# 💾  ДЕДУПЛИКАЦИЯ (хранит ID уже отправленных записей)
 # =============================================================
 
-def build_rss_feeds(keywords: list) -> list:
-    """Генерирует Google News RSS для каждого ключевого слова + фиксированные источники"""
-
-    feeds = []
-
-    # Google News RSS по каждому ключевому слову (самый мощный источник)
-    for kw in keywords:
-        encoded = urllib.parse.quote(kw)
-        feeds.append({
-            "name": f"Google News: {kw}",
-            "url": f"https://news.google.com/rss/search?q={encoded}&hl=ru&gl=RU&ceid=RU:ru"
-        })
-
-    # Фиксированные RSS российских деловых изданий
-    fixed_feeds = [
-        {"name": "РБК Недвижимость",  "url": "https://realty.rbc.ru/rss/"},
-        {"name": "Ведомости",          "url": "https://www.vedomosti.ru/rss/news"},
-        {"name": "Коммерсант",         "url": "https://www.kommersant.ru/RSS/news.xml"},
-        {"name": "Forbes RU",          "url": "https://www.forbes.ru/rss"},
-        {"name": "РБК",                "url": "https://rssexport.rbc.ru/rbcnews/news/30/full.rss"},
-    ]
-    feeds.extend(fixed_feeds)
-
-    return feeds
+seen_ids: set = set()
 
 # =============================================================
-# 🔍  ЛОГИКА ПАРСИНГА
+# 🏛️  ИСТОЧНИК 1: torgi.gov.ru API
 # =============================================================
 
-seen_urls: set = set()  # дедупликация — не показываем одно и то же дважды
+TORGI_API = "https://torgi.gov.ru/new/api/lotcards/search"
 
-def fetch_news(keywords: list) -> list:
-    """Парсит все источники, фильтрует по ключевым словам"""
+async def fetch_torgi(session: aiohttp.ClientSession, keyword: str) -> list:
+    """Ищет лоты на torgi.gov.ru по ключевому слову"""
     results = []
-    feeds = build_rss_feeds(keywords)
-
-    for feed_info in feeds:
-        try:
-            feed = feedparser.parse(feed_info["url"])
-            for entry in feed.entries[:20]:  # берём последние 20 из каждого источника
-                title = entry.get("title", "")
-                summary = entry.get("summary", "")
-                link = entry.get("link", "")
-
-                if not link or link in seen_urls:
+    try:
+        params = {
+            "text": keyword,
+            "page": 0,
+            "size": 20,
+            "sortField": "firstVersionPublicationDate",
+            "sortAsc": "false",
+        }
+        async with session.get(TORGI_API, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json(content_type=None)
+            lots = data.get("content", [])
+            for lot in lots:
+                lot_id = str(lot.get("id", ""))
+                if not lot_id or lot_id in seen_ids:
                     continue
 
-                # Проверяем вхождение ключевых слов (регистронезависимо)
-                combined_text = (title + " " + summary).lower()
-                matched_kw = [kw for kw in keywords if kw.lower() in combined_text]
+                title    = lot.get("lotName", "") or lot.get("biddingObjectInfo", "")
+                notice   = lot.get("noticeNumber", "")
+                region   = lot.get("subjectRFCode", {})
+                if isinstance(region, dict):
+                    region = region.get("name", "")
+                pub_date = lot.get("firstVersionPublicationDate", "")[:10] if lot.get("firstVersionPublicationDate") else ""
+                price    = lot.get("priceMin", "")
+                link     = f"https://torgi.gov.ru/new/public/lots/lot/{lot_id}"
 
-                if matched_kw:
-                    seen_urls.add(link)
-                    results.append({
-                        "title": title,
-                        "link": link,
-                        "source": feed_info["name"],
-                        "keywords": matched_kw,
-                        "published": entry.get("published", ""),
-                    })
+                # Проверяем совпадение ключевых слов
+                search_text = (title or "").lower()
+                if not any(kw.lower() in search_text for kw in KEYWORDS):
+                    # Если не совпало по названию — пропускаем (уже отфильтровано API)
+                    # но добавляем если искали конкретным словом
+                    pass
 
+                seen_ids.add(lot_id)
+                price_str = f"\n💰 Начальная цена: *{int(float(price)):,} ₽*".replace(",", " ") if price else ""
+                results.append({
+                    "uid":    lot_id,
+                    "source": "🏛 torgi.gov.ru",
+                    "title":  title or f"Лот №{notice}",
+                    "region": region,
+                    "date":   pub_date,
+                    "price":  price_str,
+                    "link":   link,
+                    "keyword": keyword,
+                })
+    except Exception as e:
+        logging.warning(f"torgi.gov.ru ошибка [{keyword}]: {e}")
+    return results
+
+
+async def fetch_all_torgi() -> list:
+    """Запрашивает torgi.gov.ru по всем ключевым словам параллельно"""
+    results = []
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_torgi(session, kw) for kw in KEYWORDS]
+        batches = await asyncio.gather(*tasks, return_exceptions=True)
+        for batch in batches:
+            if isinstance(batch, list):
+                results.extend(batch)
+
+    # Убираем дубли по uid
+    seen = set()
+    unique = []
+    for item in results:
+        if item["uid"] not in seen:
+            seen.add(item["uid"])
+            unique.append(item)
+    return unique
+
+# =============================================================
+# 📋  ИСТОЧНИК 2: zakupki.gov.ru RSS
+# =============================================================
+
+def fetch_zakupki() -> list:
+    """Парсит RSS закупок по ключевым словам"""
+    results = []
+    for kw in KEYWORDS[:6]:  # берём первые 6 самых важных
+        try:
+            encoded = urllib.parse.quote(kw)
+            url = f"https://zakupki.gov.ru/epz/order/extendedsearch/rss.html?searchString={encoded}&morphology=on&fz44=on&fz223=on"
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:10]:
+                uid  = entry.get("link", "") or entry.get("id", "")
+                if not uid or uid in seen_ids:
+                    continue
+                title = entry.get("title", "")
+                date  = entry.get("published", "")[:10] if entry.get("published") else ""
+                seen_ids.add(uid)
+                results.append({
+                    "uid":    uid,
+                    "source": "📋 zakupki.gov.ru",
+                    "title":  title,
+                    "region": "",
+                    "date":   date,
+                    "price":  "",
+                    "link":   uid,
+                    "keyword": kw,
+                })
         except Exception as e:
-            logging.warning(f"Ошибка парсинга {feed_info['name']}: {e}")
+            logging.warning(f"zakupki.gov.ru ошибка [{kw}]: {e}")
+    return results
 
-    return results[:MAX_NEWS_PER_DIGEST]
+# =============================================================
+# 📰  ИСТОЧНИК 3: Google News RSS
+# =============================================================
+
+def fetch_google_news() -> list:
+    """Парсит Google News по ключевым словам"""
+    results = []
+    for kw in KEYWORDS:
+        try:
+            encoded = urllib.parse.quote(kw)
+            url = f"https://news.google.com/rss/search?q={encoded}&hl=ru&gl=RU&ceid=RU:ru"
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                uid  = entry.get("link", "")
+                if not uid or uid in seen_ids:
+                    continue
+                title = entry.get("title", "")
+                date  = entry.get("published", "")[:16] if entry.get("published") else ""
+                seen_ids.add(uid)
+                results.append({
+                    "uid":    uid,
+                    "source": "📰 Google News",
+                    "title":  title,
+                    "region": "",
+                    "date":   date,
+                    "price":  "",
+                    "link":   uid,
+                    "keyword": kw,
+                })
+        except Exception as e:
+            logging.warning(f"Google News ошибка [{kw}]: {e}")
+    return results
+
+# =============================================================
+# 📤  ФОРМАТИРОВАНИЕ И ОТПРАВКА
+# =============================================================
+
+def format_item(item: dict) -> str:
+    region_str = f"\n📍 {item['region']}" if item["region"] else ""
+    date_str   = f"\n📅 {item['date']}"   if item["date"]   else ""
+    kw_str     = f"\n🔑 _{item['keyword']}_"
+
+    # Экранируем спецсимволы MarkdownV2
+    title = (item["title"]
+             .replace("&", "&amp;")
+             .replace("<", "")
+             .replace(">", ""))
+
+    return (
+        f"{item['source']}{region_str}{date_str}\n"
+        f"*{title}*"
+        f"{item.get('price', '')}"
+        f"{kw_str}\n"
+        f"[Открыть →]({item['link']})"
+    )
 
 
-def format_news(news_list: list) -> str:
-    """Форматирует список новостей в текст для Telegram"""
-    if not news_list:
-        return "📭 Новых релевантных новостей нет."
+async def send_items(app: Application, items: list):
+    """Отправляет каждый найденный элемент отдельным сообщением"""
+    for item in items[:20]:  # максимум 20 за один прогон
+        try:
+            text = format_item(item)
+            await app.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=text,
+                parse_mode=ParseMode.MARKDOWN,
+                disable_web_page_preview=True,
+            )
+            await asyncio.sleep(1)  # пауза между сообщениями
+        except Exception as e:
+            logging.error(f"Ошибка отправки: {e}\nТекст: {item['title']}")
 
-    lines = [f"📰 *Дайджест новостей* — {datetime.now().strftime('%d.%m %H:%M')}\n"]
+# =============================================================
+# ⏰  ОСНОВНОЙ ЦИКЛ МОНИТОРИНГА
+# =============================================================
 
-    for i, item in enumerate(news_list, 1):
-        kw_str = ", ".join(item["keywords"][:2])  # показываем макс 2 совпавших слова
-        lines.append(
-            f"{i}\\. [{item['title']}]({item['link']})\n"
-            f"   _📍 {item['source']} · 🔑 {kw_str}_\n"
-        )
+async def run_monitor(app: Application):
+    """Запускается каждые CHECK_INTERVAL_MINUTES минут"""
+    logging.info("🔍 Запуск мониторинга...")
 
-    return "\n".join(lines)
+    # Собираем данные из всех источников
+    torgi_items   = await fetch_all_torgi()
+    zakupki_items = fetch_zakupki()
+    news_items    = fetch_google_news()
+
+    all_items = torgi_items + zakupki_items + news_items
+
+    if all_items:
+        logging.info(f"✅ Найдено новых записей: {len(all_items)}")
+        await send_items(app, all_items)
+    else:
+        logging.info("ℹ️ Новых записей нет")
 
 # =============================================================
 # 🤖  КОМАНДЫ БОТА
@@ -140,27 +279,33 @@ def format_news(news_list: list) -> str:
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 *Бот для мониторинга новостей запущен*\n\n"
+        "👋 *КРТ-Монитор запущен*\n\n"
+        "Слежу за:\n"
+        "• 🏛 torgi.gov.ru\n"
+        "• 📋 zakupki.gov.ru\n"
+        "• 📰 Google News\n\n"
+        f"Проверка каждые *{CHECK_INTERVAL_MINUTES} мин*\n\n"
         "Команды:\n"
-        "/news — получить новости прямо сейчас\n"
-        "/keywords — показать текущие ключевые слова\n"
-        "/addkw слово — добавить ключевое слово\n"
-        "/delkw слово — удалить ключевое слово\n"
-        "/chatid — узнать твой chat\\_id\n"
+        "/check — проверить прямо сейчас\n"
+        "/keywords — список ключевых слов\n"
+        "/addkw слово — добавить\n"
+        "/delkw слово — удалить\n"
     )
-    await update.message.reply_text(text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode=ParseMode.MARKDOWN)
 
 
-async def cmd_news(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔍 Ищу новости...")
-    news = fetch_news(KEYWORDS)
-    msg = format_news(news)
-    await update.message.reply_text(msg, parse_mode="MarkdownV2", disable_web_page_preview=True)
+async def cmd_check(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🔍 Запускаю проверку...")
+    await run_monitor(ctx.application)
+    await update.message.reply_text("✅ Готово. Новые записи отправлены в канал.")
 
 
 async def cmd_keywords(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    kw_list = "\n".join([f"• {kw}" for kw in KEYWORDS])
-    await update.message.reply_text(f"🔑 *Текущие ключевые слова:*\n{kw_list}", parse_mode="Markdown")
+    kw_list = "\n".join([f"{i+1}. {kw}" for i, kw in enumerate(KEYWORDS)])
+    await update.message.reply_text(
+        f"🔑 *Ключевые слова ({len(KEYWORDS)}):\n*{kw_list}",
+        parse_mode=ParseMode.MARKDOWN
+    )
 
 
 async def cmd_add_keyword(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -170,9 +315,9 @@ async def cmd_add_keyword(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kw = " ".join(ctx.args)
     if kw not in KEYWORDS:
         KEYWORDS.append(kw)
-        await update.message.reply_text(f"✅ Добавлено: *{kw}*\nВсего: {len(KEYWORDS)} слов", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ Добавлено: *{kw}*", parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text(f"Слово «{kw}» уже есть в списке.")
+        await update.message.reply_text(f"Уже есть: {kw}")
 
 
 async def cmd_del_keyword(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -182,64 +327,41 @@ async def cmd_del_keyword(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kw = " ".join(ctx.args)
     if kw in KEYWORDS:
         KEYWORDS.remove(kw)
-        await update.message.reply_text(f"🗑 Удалено: *{kw}*\nОсталось: {len(KEYWORDS)} слов", parse_mode="Markdown")
+        await update.message.reply_text(f"🗑 Удалено: *{kw}*", parse_mode=ParseMode.MARKDOWN)
     else:
-        await update.message.reply_text(f"Слово «{kw}» не найдено в списке.")
-
-
-async def cmd_chatid(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"Твой chat_id: `{update.effective_chat.id}`", parse_mode="Markdown")
-
-
-# =============================================================
-# ⏰  АВТОДАЙДЖЕСТ ПО РАСПИСАНИЮ
-# =============================================================
-
-async def scheduled_digest(app: Application):
-    """Вызывается автоматически каждые CHECK_INTERVAL_HOURS часов"""
-    news = fetch_news(KEYWORDS)
-    if news:  # отправляем только если есть что-то новое
-        msg = format_news(news)
-        await app.bot.send_message(
-            chat_id=CHAT_ID,
-            text=msg,
-            parse_mode="MarkdownV2",
-            disable_web_page_preview=True
-        )
+        await update.message.reply_text(f"Не найдено: {kw}")
 
 # =============================================================
 # 🚀  ЗАПУСК
 # =============================================================
 
+async def post_init(app: Application):
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        run_monitor,
+        trigger="interval",
+        minutes=CHECK_INTERVAL_MINUTES,
+        args=[app],
+        id="monitor",
+    )
+    scheduler.start()
+    logging.info(f"✅ Мониторинг запущен. Интервал: {CHECK_INTERVAL_MINUTES} мин.")
+    logging.info(f"📋 Ключевых слов: {len(KEYWORDS)}")
+
+
 def main():
     logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(asctime)s [%(levelname)s] %(message)s",
         level=logging.INFO
     )
 
-    app = Application.builder().token(TOKEN).build()
+    app = Application.builder().token(TOKEN).post_init(post_init).build()
 
-    # Регистрируем команды
     app.add_handler(CommandHandler("start",    cmd_start))
-    app.add_handler(CommandHandler("news",     cmd_news))
+    app.add_handler(CommandHandler("check",    cmd_check))
     app.add_handler(CommandHandler("keywords", cmd_keywords))
     app.add_handler(CommandHandler("addkw",    cmd_add_keyword))
     app.add_handler(CommandHandler("delkw",    cmd_del_keyword))
-    app.add_handler(CommandHandler("chatid",   cmd_chatid))
-
-    # Автодайджест по расписанию
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
-        scheduled_digest,
-        trigger="interval",
-        hours=CHECK_INTERVAL_HOURS,
-        args=[app],
-        id="digest"
-    )
-    scheduler.start()
-
-    print(f"✅ Бот запущен. Дайджест каждые {CHECK_INTERVAL_HOURS} ч.")
-    print(f"📋 Ключевых слов: {len(KEYWORDS)}")
 
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
