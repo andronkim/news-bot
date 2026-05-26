@@ -35,8 +35,8 @@ from telegram.constants import ParseMode
 # =============================================================
 
 import os
-TOKEN      = os.environ.get("TOKEN", "8326800586:AAECnNqoc97CBzHraS7u1eHLaTAbDe6EkqY")
-CHANNEL_ID = os.environ.get("CHANNEL_ID", "@krt_newss")  # например: @my_channel или -1001234567890
+TOKEN      = os.environ.get("TOKEN", "ВСТАВЬ_ТОКЕН_БОТА")
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "ВСТАВЬ_ID_КАНАЛА")  # например: @my_channel или -1001234567890
 
 # Как часто проверять (в минутах)
 CHECK_INTERVAL_MINUTES = 60
@@ -74,6 +74,15 @@ seen_ids: set = set()
 
 TORGI_API = "https://torgi.gov.ru/new/api/lotcards/search"
 
+# Заголовки браузера — нужны чтобы госпорталы не блокировали запросы с облачных серверов
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Referer": "https://torgi.gov.ru/",
+    "Origin": "https://torgi.gov.ru",
+}
+
 async def fetch_torgi(session: aiohttp.ClientSession, keyword: str) -> list:
     """Ищет лоты на torgi.gov.ru по ключевому слову"""
     results = []
@@ -85,8 +94,14 @@ async def fetch_torgi(session: aiohttp.ClientSession, keyword: str) -> list:
             "sortField": "firstVersionPublicationDate",
             "sortAsc": "false",
         }
-        async with session.get(TORGI_API, params=params, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+        async with session.get(
+            TORGI_API,
+            params=params,
+            headers=BROWSER_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
             if resp.status != 200:
+                logging.warning(f"torgi.gov.ru [{keyword}]: HTTP {resp.status}")
                 return []
             data = await resp.json(content_type=None)
             lots = data.get("content", [])
@@ -146,6 +161,39 @@ async def fetch_all_torgi() -> list:
             seen.add(item["uid"])
             unique.append(item)
     return unique
+
+# =============================================================
+# 🔎  РЕЗЕРВ: Google News по сайту torgi.gov.ru
+# =============================================================
+
+def fetch_torgi_via_google() -> list:
+    """Если torgi.gov.ru API недоступен — ищем его лоты через Google News"""
+    results = []
+    for kw in KEYWORDS[:5]:
+        try:
+            query = urllib.parse.quote(f'site:torgi.gov.ru {kw}')
+            url = f"https://news.google.com/rss/search?q={query}&hl=ru&gl=RU&ceid=RU:ru"
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                uid = entry.get("link", "")
+                if not uid or uid in seen_ids:
+                    continue
+                title = entry.get("title", "")
+                date  = entry.get("published", "")[:10] if entry.get("published") else ""
+                seen_ids.add(uid)
+                results.append({
+                    "uid":    uid,
+                    "source": "🏛 torgi.gov.ru (Google)",
+                    "title":  title,
+                    "region": "",
+                    "date":   date,
+                    "price":  "",
+                    "link":   uid,
+                    "keyword": kw,
+                })
+        except Exception as e:
+            logging.warning(f"torgi Google fallback ошибка [{kw}]: {e}")
+    return results
 
 # =============================================================
 # 📋  ИСТОЧНИК 2: zakupki.gov.ru RSS
@@ -214,6 +262,40 @@ def fetch_google_news() -> list:
     return results
 
 # =============================================================
+# 🔴  ИСТОЧНИК 4: Яндекс.Новости RSS
+# =============================================================
+
+def fetch_yandex_news() -> list:
+    """Парсит Яндекс.Новости по ключевым словам"""
+    results = []
+    for kw in KEYWORDS:
+        try:
+            encoded = urllib.parse.quote(kw)
+            # lr=213 — Москва, можно убрать для новостей по всей России
+            url = f"https://news.yandex.ru/search.rss?text={encoded}&lr=213"
+            feed = feedparser.parse(url)
+            for entry in feed.entries[:5]:
+                uid = entry.get("link", "") or entry.get("id", "")
+                if not uid or uid in seen_ids:
+                    continue
+                title = entry.get("title", "")
+                date  = entry.get("published", "")[:10] if entry.get("published") else ""
+                seen_ids.add(uid)
+                results.append({
+                    "uid":    uid,
+                    "source": "🔴 Яндекс.Новости",
+                    "title":  title,
+                    "region": "",
+                    "date":   date,
+                    "price":  "",
+                    "link":   uid,
+                    "keyword": kw,
+                })
+        except Exception as e:
+            logging.warning(f"Яндекс.Новости ошибка [{kw}]: {e}")
+    return results
+
+# =============================================================
 # 📤  ФОРМАТИРОВАНИЕ И ОТПРАВКА
 # =============================================================
 
@@ -262,10 +344,15 @@ async def run_monitor(app: Application):
 
     # Собираем данные из всех источников
     torgi_items   = await fetch_all_torgi()
+    # Если torgi API вернул 0 — используем Google-резерв
+    if not torgi_items:
+        logging.info("torgi.gov.ru API недоступен, используем Google-резерв")
+        torgi_items = fetch_torgi_via_google()
     zakupki_items = fetch_zakupki()
     news_items    = fetch_google_news()
+    yandex_items  = fetch_yandex_news()
 
-    all_items = torgi_items + zakupki_items + news_items
+    all_items = torgi_items + zakupki_items + news_items + yandex_items
 
     if all_items:
         logging.info(f"✅ Найдено новых записей: {len(all_items)}")
@@ -283,7 +370,8 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Слежу за:\n"
         "• 🏛 torgi.gov.ru\n"
         "• 📋 zakupki.gov.ru\n"
-        "• 📰 Google News\n\n"
+        "• 📰 Google News\n"
+        "• 🔴 Яндекс.Новости\n\n"
         f"Проверка каждые *{CHECK_INTERVAL_MINUTES} мин*\n\n"
         "Команды:\n"
         "/check — проверить прямо сейчас\n"
